@@ -1,17 +1,28 @@
-name: Build and Push Kubernetes Component Images
+name: Build and Push Kubernetes Images
 
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: "Git branch or tag to build, e.g. master, release-1.34, v1.34.7"
+        required: true
+        default: "master"
+        type: string
       image_tag:
-        description: "Docker image tag, e.g. v1.34.0-custom. Default uses short SHA"
-        required: false
-        default: ""
+        description: "Docker image tag to push, e.g. v1.34.7-custom"
+        required: true
+        default: "custom"
+        type: string
       push_latest:
-        description: "Also push latest tag"
-        required: false
-        type: boolean
+        description: "Also push :latest"
+        required: true
         default: false
+        type: boolean
+      components:
+        description: "Comma-separated components, e.g. kube-apiserver,kube-controller-manager,kube-scheduler,kube-proxy"
+        required: true
+        default: "kube-apiserver,kube-controller-manager,kube-scheduler,kube-proxy"
+        type: string
 
 permissions:
   contents: read
@@ -23,34 +34,28 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
-      - name: Checkout
+      - name: Checkout selected source ref
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 0
+          fetch-tags: true
 
-      - name: Show git info
+      - name: Show selected source
         run: |
-          git branch --show-current || true
+          echo "source_ref=${{ inputs.source_ref }}"
+          echo "image_tag=${{ inputs.image_tag }}"
+          echo "components=${{ inputs.components }}"
           git rev-parse HEAD
-          git status
+          git describe --tags --always || true
+          git status --short || true
 
-      - name: Work around possible git multi-pack-index issue
+      - name: Work around possible git pack index issue
         run: |
           rm -f .git/objects/pack/multi-pack-index || true
-          git fsck || true
-
-      - name: Set image tag
-        id: vars
-        run: |
-          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
-            TAG="${{ github.event.inputs.image_tag }}"
-          else
-            TAG="$(git rev-parse --short=12 HEAD)"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -68,60 +73,81 @@ jobs:
         run: |
           make quick-release-images
 
-      - name: List generated image archives
+      - name: List generated release image tarballs
         run: |
-          ls -lh _output/release-images/amd64/
+          find _output/release-images -maxdepth 3 -type f -name "*.tar" | sort
 
-      - name: Load, retag and push images
+      - name: Load, retag and push selected images
+        shell: bash
         env:
-          TAG: ${{ steps.vars.outputs.tag }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          COMPONENTS: ${{ inputs.components }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          components=(
-            kube-apiserver
-            kube-controller-manager
-            kube-scheduler
-            kube-proxy
-          )
+          IFS=',' read -ra comps <<< "$COMPONENTS"
 
-          for c in "${components[@]}"; do
+          trim() {
+            local s="$1"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          for raw in "${comps[@]}"; do
+            c="$(trim "$raw")"
+            [ -n "$c" ] || continue
+
             tarball="_output/release-images/amd64/${c}.tar"
             if [ ! -f "$tarball" ]; then
-              echo "missing tarball: $tarball"
+              echo "ERROR: missing tarball: $tarball"
+              echo "Available files:"
+              find _output/release-images -maxdepth 3 -type f -name "*.tar" | sort || true
               exit 1
             fi
 
-            echo "Loading $tarball"
+            echo "=== Loading ${tarball}"
             docker load -i "$tarball"
 
-            # 找到刚刚 load 进来的镜像名
-            src="$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "/${c}-amd64:" | head -n1 || true)"
+            src=""
+            while IFS= read -r line; do
+              if [[ "$line" =~ /${c}-amd64: ]] || [[ "$line" =~ (^|/)${c}-amd64: ]]; then
+                src="$line"
+                break
+              fi
+            done < <(docker images --format '{{.Repository}}:{{.Tag}}')
+
             if [ -z "$src" ]; then
-              src="$(docker images --format '{{.Repository}}:{{.Tag}}' | grep "${c}-amd64:" | head -n1 || true)"
-            fi
-            if [ -z "$src" ]; then
-              echo "cannot find loaded source image for $c"
+              echo "ERROR: cannot find loaded source image for component $c"
               docker images
               exit 1
             fi
 
-            dst="${REGISTRY}/${IMAGE_NAMESPACE}/${c}:${TAG}"
-            echo "Tagging $src -> $dst"
+            dst="${REGISTRY}/${IMAGE_NAMESPACE}/${c}:${IMAGE_TAG}"
+            echo "=== Tagging ${src} -> ${dst}"
             docker tag "$src" "$dst"
+
+            echo "=== Pushing ${dst}"
             docker push "$dst"
 
-            if [ "${{ github.event.inputs.push_latest }}" = "true" ]; then
+            if [ "$PUSH_LATEST" = "true" ]; then
               latest="${REGISTRY}/${IMAGE_NAMESPACE}/${c}:latest"
+              echo "=== Tagging ${src} -> ${latest}"
               docker tag "$src" "$latest"
+              echo "=== Pushing ${latest}"
               docker push "$latest"
             fi
           done
 
-      - name: Print pushed images
-        env:
-          TAG: ${{ steps.vars.outputs.tag }}
+      - name: Print pushed image list
         run: |
-          for c in kube-apiserver kube-controller-manager kube-scheduler kube-proxy; do
-            echo "docker.io/${IMAGE_NAMESPACE}/${c}:${TAG}"
+          IFS=',' read -ra comps <<< "${{ inputs.components }}"
+          for c in "${comps[@]}"; do
+            c="$(echo "$c" | xargs)"
+            [ -n "$c" ] || continue
+            echo "docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${c}:${{ inputs.image_tag }}"
+            if [ "${{ inputs.push_latest }}" = "true" ]; then
+              echo "docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${c}:latest"
+            fi
           done
