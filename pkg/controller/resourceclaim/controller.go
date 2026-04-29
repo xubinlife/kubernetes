@@ -291,6 +291,10 @@ func (ec *Controller) podNeedsWork(pod *v1.Pod) (bool, string) {
 		return false, "pod is deleted"
 	}
 
+	if podutil.IsPodTerminal(pod) {
+		return false, "pod has terminated"
+	}
+
 	for _, podClaim := range pod.Spec.ResourceClaims {
 		claimName, checkOwner, err := resourceclaim.Name(pod, &podClaim)
 		if err != nil {
@@ -477,6 +481,11 @@ func (ec *Controller) syncPod(ctx context.Context, namespace, name string) error
 	// Ignore pods which are already getting deleted.
 	if pod.DeletionTimestamp != nil {
 		logger.V(5).Info("nothing to do for pod, it is marked for deletion")
+		return nil
+	}
+
+	if podutil.IsPodTerminal(pod) {
+		logger.V(5).Info("nothing to do for pod, it has terminated")
 		return nil
 	}
 
